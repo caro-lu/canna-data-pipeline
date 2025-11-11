@@ -1,0 +1,290 @@
+{
+    "name": "Table_Incremental_Processing_Pipeline",
+    "properties": {
+        "activities": [
+            {
+                "name": "Get_Source_Row_Count",
+                "description": "Count rows in source table for validation",
+                "type": "Lookup",
+                "dependsOn": [
+                    {
+                        "activity": "Set_Watermark_Column",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "typeProperties": {
+                    "source": {
+                        "type": "PostgreSqlV2Source",
+                        "query": {
+                            "value": "@concat('SELECT COUNT(*) as row_count FROM ', pipeline().parameters.SchemaName, '.', pipeline().parameters.TableName)",
+                            "type": "Expression"
+                        },
+                        "queryTimeout": "02:00:00"
+                    },
+                    "dataset": {
+                        "referenceName": "Source_PostgreSQL_Tables",
+                        "type": "DatasetReference",
+                        "parameters": {
+                            "SchemaName": "@pipeline().parameters.SchemaName",
+                            "TableName": "@pipeline().parameters.TableName"
+                        }
+                    }
+                }
+            },
+            {
+                "name": "Copy_To_DataLake",
+                "description": "Copy incremental data to Azure Data Lake",
+                "type": "Copy",
+                "dependsOn": [
+                    {
+                        "activity": "Check_Duplicates",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "typeProperties": {
+                    "source": {
+                        "type": "PostgreSqlV2Source",
+                        "query": {
+                            "value": "@if(equals(variables('LoadStrategy'), 'ROLLING_30DAY'),\n  concat('SELECT * FROM ', pipeline().parameters.SchemaName, '.', pipeline().parameters.TableName, ' WHERE ', variables('WatermarkCol'), ' >= CURRENT_DATE - INTERVAL ''30 days'''),\n  if(equals(variables('LoadStrategy'), 'FULL_RELOAD'),\n    concat('SELECT * FROM ', pipeline().parameters.SchemaName, '.', pipeline().parameters.TableName),\n    concat('SELECT * FROM ', pipeline().parameters.SchemaName, '.', pipeline().parameters.TableName, ' WHERE ', variables('WatermarkCol'), ' > ''', pipeline().parameters.LastWatermark, '''')\n  )\n)",
+                            "type": "Expression"
+                        },
+                        "queryTimeout": "02:00:00"
+                    },
+                    "sink": {
+                        "type": "JsonSink",
+                        "storeSettings": {
+                            "type": "AzureBlobFSWriteSettings"
+                        },
+                        "formatSettings": {
+                            "type": "JsonWriteSettings"
+                        }
+                    },
+                    "enableStaging": false,
+                    "parallelCopies": {
+                        "value": "@int(variables('ParallelCopies'))",
+                        "type": "Expression"
+                    },
+                    "validateDataConsistency": true,
+                    "logSettings": {
+                        "enableCopyActivityLog": true,
+                        "copyActivityLogSettings": {
+                            "logLevel": "Info"
+                        }
+                    },
+                    "dataIntegrationUnits": {
+                        "value": "@int(variables('DataIntegrationUnits'))",
+                        "type": "Expression"
+                    }
+                },
+                "inputs": [
+                    {
+                        "referenceName": "Source_PostgreSQL_Tables",
+                        "type": "DatasetReference",
+                        "parameters": {
+                            "SchemaName": "@pipeline().parameters.SchemaName",
+                            "TableName": "@pipeline().parameters.TableName"
+                        }
+                    }
+                ],
+                "outputs": [
+                    {
+                        "referenceName": "DataLake_JSON",
+                        "type": "DatasetReference",
+                        "parameters": {
+                            "Container": "raw",
+                            "Directory": {
+                                "value": "@concat(pipeline().parameters.SourceDatabase, '/', pipeline().parameters.TableName, '/', pipeline().parameters.RunDate, '/', pipeline().RunId)",
+                                "type": "Expression"
+                            },
+                            "FileName": {
+                                "value": "@concat(pipeline().parameters.SchemaName, '_', pipeline().parameters.TableName, '_', formatDateTime(utcNow(), 'yyyyMMdd_HHmmss'), '_', variables('LoadStrategy'), '.json')",
+                                "type": "Expression"
+                            }
+                        }
+                    }
+                ]
+            },
+            {
+                "name": "Load_To_Snowflake",
+                "description": "Load data to Snowflake data warehouse",
+                "type": "Script",
+                "dependsOn": [
+                    {
+                        "activity": "Copy_To_DataLake",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "linkedServiceName": {
+                    "referenceName": "Destination_Snowflake",
+                    "type": "LinkedServiceReference"
+                },
+                "typeProperties": {
+                    "scripts": [
+                        {
+                            "type": "Query",
+                            "text": {
+                                "value": "@concat('COPY INTO BRONZE.', pipeline().parameters.TableName, ' FROM @BRONZE.DATA_LAKE_STAGE/', pipeline().parameters.SourceDatabase, '/', pipeline().parameters.TableName, '/', pipeline().parameters.RunDate, '/', pipeline().RunId, '/ FILE_FORMAT = (TYPE = JSON) ON_ERROR = ''CONTINUE'';')",
+                                "type": "Expression"
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "name": "Check_Duplicates",
+                "description": "Detect duplicate records",
+                "type": "Lookup",
+                "dependsOn": [
+                    {
+                        "activity": "Get_Source_Row_Count",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "typeProperties": {
+                    "source": {
+                        "type": "PostgreSqlV2Source",
+                        "query": {
+                            "value": "@concat('SELECT (SELECT COUNT(*) FROM ', pipeline().parameters.SchemaName, '.', pipeline().parameters.TableName, ') - (SELECT COUNT(*) FROM (SELECT DISTINCT * FROM ', pipeline().parameters.SchemaName, '.', pipeline().parameters.TableName, ') t) as duplicate_count')",
+                            "type": "Expression"
+                        }
+                    },
+                    "dataset": {
+                        "referenceName": "Source_PostgreSQL_Tables",
+                        "type": "DatasetReference",
+                        "parameters": {
+                            "SchemaName": "@pipeline().parameters.SchemaName",
+                            "TableName": "@pipeline().parameters.TableName"
+                        }
+                    }
+                }
+            },
+            {
+                "name": "Get_Load_Strategy",
+                "type": "Lookup",
+                "dependsOn": [],
+                "typeProperties": {
+                    "source": {
+                        "type": "SnowflakeV2Source",
+                        "query": {
+                            "value": "SELECT COALESCE(load_strategy, 'INCREMENTAL') as load_strategy, COALESCE(parallel_copies, 8) as parallel_copies, COALESCE(data_integration_units, 16) as data_integration_units, COALESCE(watermark_column, 'modified_date') as watermark_column FROM UTILITY.TABLE_STRATEGY_CONFIG WHERE table_name = '@{pipeline().parameters.TableName}' AND is_active = TRUE",
+                            "type": "Expression"
+                        }
+                    },
+                    "dataset": {
+                        "referenceName": "Destination_Snowflake_Dataset",
+                        "type": "DatasetReference"
+                    }
+                }
+            },
+            {
+                "name": "Set_Load_Strategy",
+                "type": "SetVariable",
+                "dependsOn": [
+                    {
+                        "activity": "Get_Load_Strategy",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "typeProperties": {
+                    "variableName": "LoadStrategy",
+                    "value": {
+                        "value": "@activity('Get_Load_Strategy').output.firstRow.load_strategy",
+                        "type": "Expression"
+                    }
+                }
+            },
+            {
+                "name": "Set_Watermark_Column",
+                "type": "SetVariable",
+                "dependsOn": [
+                    {
+                        "activity": "Set_Load_Strategy",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "typeProperties": {
+                    "variableName": "WatermarkCol",
+                    "value": {
+                        "value": "@activity('Get_Load_Strategy').output.firstRow.watermark_column",
+                        "type": "Expression"
+                    }
+                }
+            }
+        ],
+        "parameters": {
+            "SourceDatabase": {
+                "type": "string",
+                "defaultValue": "source_db"
+            },
+            "SchemaName": {
+                "type": "string",
+                "defaultValue": "public"
+            },
+            "TableName": {
+                "type": "string"
+            },
+            "WatermarkColumn": {
+                "type": "string",
+                "defaultValue": "modified_date"
+            },
+            "LastWatermark": {
+                "type": "string",
+                "defaultValue": "2000-01-01 00:00:00"
+            },
+            "RunDate": {
+                "type": "string"
+            }
+        },
+        "variables": {
+            "ValidationStatus": {
+                "type": "String"
+            },
+            "LoadStrategy": {
+                "type": "String",
+                "defaultValue": "INCREMENTAL"
+            },
+            "ParallelCopies": {
+                "type": "String",
+                "defaultValue": "8"
+            },
+            "DataIntegrationUnits": {
+                "type": "String",
+                "defaultValue": "16"
+            },
+            "WatermarkCol": {
+                "type": "String",
+                "defaultValue": "modified_date"
+            }
+        },
+        "annotations": []
+    },
+    "type": "Microsoft.DataFactory/factories/pipelines"
+}
