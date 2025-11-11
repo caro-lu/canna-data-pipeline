@@ -1,0 +1,177 @@
+{
+    "name": "Main_Incremental_Pipeline",
+    "properties": {
+        "activities": [
+            {
+                "name": "Set_Pipeline_Start_Time",
+                "description": "Set the start time of when the pipeline runs",
+                "type": "SetVariable",
+                "dependsOn": [],
+                "policy": {
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "typeProperties": {
+                    "variableName": "PipelineStartTime",
+                    "value": {
+                        "value": "@formatDateTime(utcnow(), 'yyyy-MM-dd')",
+                        "type": "Expression"
+                    }
+                }
+            },
+            {
+                "name": "ForEach_Incremental_Table",
+                "type": "ForEach",
+                "dependsOn": [
+                    {
+                        "activity": "Get_Source_Tables",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "userProperties": [],
+                "typeProperties": {
+                    "items": {
+                        "value": "@activity('Get_Source_Tables').output.value",
+                        "type": "Expression"
+                    },
+                    "isSequential": true,
+                    "activities": [
+                        {
+                            "name": "Execute_Incremental_Load",
+                            "type": "ExecutePipeline",
+                            "dependsOn": [],
+                            "policy": {
+                                "secureInput": false
+                            },
+                            "userProperties": [],
+                            "typeProperties": {
+                                "pipeline": {
+                                    "referenceName": "Table_Incremental_Processing_Pipeline",
+                                    "type": "PipelineReference"
+                                },
+                                "waitOnCompletion": true,
+                                "parameters": {
+                                    "SourceDatabase": "source_db",
+                                    "SchemaName": "public",
+                                    "TableName": {
+                                        "value": "@item().tablename",
+                                        "type": "Expression"
+                                    },
+                                    "WatermarkColumn": {
+                                        "value": "@item().watermark_column",
+                                        "type": "Expression"
+                                    },
+                                    "LastWatermark": {
+                                        "value": "@item().last_watermark",
+                                        "type": "Expression"
+                                    },
+                                    "RunDate": {
+                                        "value": "@variables('PipelineStartTime')",
+                                        "type": "Expression"
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            },
+            {
+                "name": "Get_Source_Tables",
+                "description": "Get all tables for incremental processing",
+                "type": "Lookup",
+                "dependsOn": [
+                    {
+                        "activity": "Initialize_Watermarks_If_Missing",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "typeProperties": {
+                    "source": {
+                        "type": "PostgreSqlV2Source",
+                        "query": "SELECT \n    'public' as schemaname,\n    t.table_name as tablename,\n    'modified_date' as watermark_column,\n    COALESCE(w.last_watermark, '1900-01-01'::timestamp) as last_watermark\nFROM (\n    VALUES ('transactions'), ('inventory'), ('customers')\n) t(table_name)\nLEFT JOIN public.watermark_control w \n    ON t.table_name = w.table_name;",
+                        "queryTimeout": "02:00:00"
+                    },
+                    "dataset": {
+                        "referenceName": "Source_PostgreSQL_Tables",
+                        "type": "DatasetReference",
+                        "parameters": {
+                            "SchemaName": "@pipeline().parameters.SchemaName",
+                            "TableName": "@pipeline().parameters.TableName"
+                        }
+                    },
+                    "firstRowOnly": false
+                }
+            },
+            {
+                "name": "Initialize_Watermarks_If_Missing",
+                "type": "Lookup",
+                "dependsOn": [
+                    {
+                        "activity": "Set_Pipeline_Start_Time",
+                        "dependencyConditions": [
+                            "Succeeded"
+                        ]
+                    }
+                ],
+                "policy": {
+                    "timeout": "0.12:00:00",
+                    "retry": 0,
+                    "retryIntervalInSeconds": 30,
+                    "secureOutput": false,
+                    "secureInput": false
+                },
+                "userProperties": [],
+                "typeProperties": {
+                    "source": {
+                        "type": "PostgreSqlV2Source",
+                        "query": "WITH new_watermarks AS (\n    INSERT INTO public.watermark_control (table_name, last_watermark, updated_at)\n    SELECT \n        t.table_name,\n        CASE \n            WHEN t.strategy = 'ROLLING_30DAY' THEN CURRENT_DATE - INTERVAL '30 days'\n            WHEN t.strategy = 'FULL_RELOAD' THEN '1900-01-01'::timestamp\n            ELSE '1900-01-01'::timestamp\n        END as last_watermark,\n        CURRENT_TIMESTAMP as updated_at\n    FROM (\n        SELECT 'transactions' as table_name, 'ROLLING_30DAY' as strategy\n        UNION ALL\n        SELECT 'inventory' as table_name, 'ROLLING_30DAY' as strategy\n        UNION ALL\n        SELECT 'customers' as table_name, 'FULL_RELOAD' as strategy\n    ) t\n    WHERE NOT EXISTS (\n        SELECT 1 FROM public.watermark_control w \n        WHERE w.table_name = t.table_name\n    )\n    RETURNING table_name, last_watermark, updated_at\n)\nSELECT \n    COALESCE((SELECT COUNT(*) FROM new_watermarks), 0) as initialized_count,\n    'Watermarks initialized' as status;",
+                        "queryTimeout": "02:00:00"
+                    },
+                    "dataset": {
+                        "referenceName": "Source_PostgreSQL_Tables",
+                        "type": "DatasetReference",
+                        "parameters": {
+                            "SchemaName": "public",
+                            "TableName": "watermark_control"
+                        }
+                    }
+                }
+            }
+        ],
+        "parameters": {
+            "SchemaName": {
+                "type": "string"
+            },
+            "TableName": {
+                "type": "string"
+            }
+        },
+        "variables": {
+            "PipelineStartTime": {
+                "type": "String"
+            },
+            "ValidationErrors": {
+                "type": "String"
+            },
+            "ProcessedTables": {
+                "type": "String"
+            }
+        },
+        "annotations": [],
+        "lastPublishTime": "2025-09-18T14:27:22Z"
+    },
+    "type": "Microsoft.DataFactory/factories/pipelines"
+}
