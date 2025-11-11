@@ -1,0 +1,11 @@
+{
+    "name": "DataLake_Storage",
+    "type": "Microsoft.DataFactory/factories/linkedservices",
+    "properties": {
+        "annotations": [],
+        "type": "AzureBlobFS",
+        "typeProperties": {
+            "url": "https://YOUR_STORAGE_ACCOUNT.dfs.core.windows.net/"
+        }
+    }
+}
