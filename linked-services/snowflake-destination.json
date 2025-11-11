@@ -1,0 +1,18 @@
+{
+    "name": "Destination_Snowflake",
+    "type": "Microsoft.DataFactory/factories/linkedservices",
+    "properties": {
+        "annotations": [],
+        "type": "SnowflakeV2",
+        "typeProperties": {
+            "authenticationType": "Basic",
+            "accountIdentifier": "YOUR_SNOWFLAKE_ACCOUNT",
+            "user": "SERVICE_ACCOUNT",
+            "database": "DATA_WAREHOUSE",
+            "warehouse": "COMPUTE_WH",
+            "role": "SERVICE_ROLE",
+            "host": "YOUR_SNOWFLAKE_ACCOUNT.snowflakecomputing.com"
+        },
+        "version": "1.1"
+    }
+}
